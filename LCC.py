@@ -96,15 +96,14 @@ COL_ABOVE = pick_col(['combusted_above', 'above.carbon.combusted'])
 COL_BELOW = pick_col(['combusted_below'])
 COL_DEPTH = pick_col(['burn_depth'])
 
-# If you later want all 3, switch back to:
+# If you later want all 3, change targets below to include COL_DEPTH too:
 # targets = [(c, "units") for c in [COL_ABOVE, COL_BELOW, COL_DEPTH] if c]
-# ALL_TARGET_COLS = [c for c in [COL_ABOVE, COL_BELOW, COL_DEPTH] if c]
-
-targets = [(c, "units") for c in [COL_DEPTH] if c]
+targets = [(c, "units") for c in [COL_ABOVE, COL_BELOW] if c]
 if not targets:
     raise ValueError("None of the expected target columns were found in the dataset.")
 
-ALL_TARGET_COLS = [c for c in [COL_DEPTH] if c]
+# IMPORTANT: include ALL possible targets for safe dropping to prevent cross-target leakage
+ALL_TARGET_COLS = [c for c in [COL_ABOVE, COL_BELOW, COL_DEPTH] if c]
 
 # ------------- GLOBAL METRICS STORAGE FOR VIOLIN PLOT -------------
 GLOBAL_METRICS = []   # will collect per-target LOOCV metrics (including R²)
@@ -114,12 +113,22 @@ def build_xy(df_in: pd.DataFrame, target_col: str):
     drop_cols = [c for c in EXCLUDE_PRED_COLS if c in df_in.columns]
     work = df_in.drop(columns=drop_cols, errors='ignore').copy()
     work = work.dropna(subset=[target_col])
+
     y = work[target_col].astype(float).copy()
-    X = work.drop(columns=ALL_TARGET_COLS, errors='ignore')
+
+    # Drop the explicit target AND any other known target columns (prevents leakage)
+    X = work.drop(columns=list(set(ALL_TARGET_COLS + [target_col])), errors='ignore')
+
+    # Guard against accidental leakage
+    assert target_col not in X.columns, f"Target leakage: {target_col} present in predictors!"
+
     # keep only numeric predictors
     non_numeric = X.select_dtypes(exclude=[np.number]).columns.tolist()
     if non_numeric:
         X = X.drop(columns=non_numeric)
+
+    if X.shape[1] == 0:
+        raise ValueError(f"No numeric predictors left after preprocessing for target '{target_col}'.")
     return X, y
 
 # ----------------- Nested LOOCV with inner tuning -----------------
@@ -159,6 +168,14 @@ def run_target_nested_loocv(target_col: str, units_label: str = "units"):
             refit=True,  # refit on full train with best params
         )
         tuner.fit(Xtr, ytr)
+
+        # Sanity: tuned model must NOT expect the target as a feature
+        tuned_features = list(getattr(tuner.best_estimator_, "feature_names_in_", []))
+        if target_col in tuned_features:
+            raise RuntimeError(
+                f"Leakage detected: tuned model expects target '{target_col}' as a feature. "
+                f"Check preprocessing."
+            )
 
         best_est = tuner.best_estimator_
         # predict held-out
@@ -231,9 +248,7 @@ def run_target_nested_loocv(target_col: str, units_label: str = "units"):
 
     # ----------------- Choose consensus hyperparameters -----------------
     # Strategy: group identical param dicts, compute median inner-CV RMSE per group, pick best (lowest)
-    # Normalize dicts into JSONable tuples so they can be grouped
     def normalize_params(d):
-        # For float max_features from uniform, keep as float; bootstrap is bool; ints as ints
         return tuple(sorted(d.items(), key=lambda x: x[0]))
 
     grp = defaultdict(list)
@@ -263,7 +278,7 @@ def run_target_nested_loocv(target_col: str, units_label: str = "units"):
     )
     final_model.fit(X, y)
 
-    # Save model + metadata
+    # Save model + metadata (include feature names for safe inference)
     model_path = os.path.join(MODEL_DIR, f"rf_final_{out_prefix}.joblib")
     joblib.dump(final_model, model_path)
 
@@ -275,6 +290,7 @@ def run_target_nested_loocv(target_col: str, units_label: str = "units"):
         "loocv_rmse": float(rmse),
         "loocv_r2": float(r2),
         "final_params": best_params,
+        "feature_names": list(getattr(final_model, "feature_names_in_", [])),
         "search_config": {
             "inner_folds": INNER_FOLDS,
             "n_iter_search": N_ITER_SEARCH,
